@@ -1,0 +1,43 @@
+name: Build GW018-DM Custom Firmware
+
+on:
+  push:
+    branches: [ "main", "dev" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y make libc6-dev-i386 libncurses5 gcc-multilib awk xxd
+
+    - name: Build Low Power (LP) image
+      run: |
+        cd project/realtek_amebaD_va0_example/GCC-RELEASE/project_lp/
+        chmod -R 777 ./
+        make all
+
+    - name: Build High Power (HP) image
+      run: |
+        cd project/realtek_amebaD_va0_example/GCC-RELEASE/project_hp/
+        chmod -R 777 ./
+        make all
+
+    - name: Collect Firmware Images
+      run: |
+        mkdir release_firmware
+        cp project/realtek_amebaD_va0_example/GCC-RELEASE/project_lp/asdk/image/km0_boot_all.bin release_firmware/
+        cp project/realtek_amebaD_va0_example/GCC-RELEASE/project_hp/asdk/image/km4_boot_all.bin release_firmware/
+        cp project/realtek_amebaD_va0_example/GCC-RELEASE/project_hp/asdk/image/km0_km4_image2.bin release_firmware/
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: gw018-dm-custom-firmware
+        path: release_firmware/*.bin
