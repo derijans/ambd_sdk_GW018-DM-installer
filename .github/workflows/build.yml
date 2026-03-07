@@ -15,7 +15,7 @@ jobs:
     - name: Install Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y make libc6-dev-i386 libncurses5 gcc-multilib awk xxd
+        sudo apt-get install -y make libc6-dev-i386 libncurses-dev gcc-multilib gawk xxd
 
     - name: Build Low Power (LP) image
       run: |
