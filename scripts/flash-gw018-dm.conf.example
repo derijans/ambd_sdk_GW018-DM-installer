@@ -1,9 +1,9 @@
 # Copy this file to scripts/flash-gw018-dm.conf and adjust the values for your setup.
 
-REPO="derijans/ambd_sdk_GW018-DM-install"
-RELEASE_TAG="0.0.1"
+REPO="derijans/ambd_sdk_GW018-DM"
+RELEASE_TAG=""
 RELEASE_ASSET_NAME=""
-ARTIFACT_NAME="gw018-dm-custom-firmware"
+RELEASE_BUNDLE_NAME="gw018-dm-custom-firmware"
 FIRMWARE_DIR=""
 UPLOAD_TOOL=".gw018-dm/tools/upload_image_tool_linux"
 PORT=""
