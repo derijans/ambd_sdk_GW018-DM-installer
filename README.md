@@ -3,6 +3,28 @@ The purpose of this is to cut the GW108-DM gateway from the cloud and use it as 
 
 **Work in Progress! Use this at your own risk! And consider making a backup before!**
 
+## Helper script
+This repo now includes a Linux helper script at `scripts/flash-gw018-dm.sh` that can stage firmware files, detect or select the USB-UART adapter, create a backup, flash the Realtek image, and guide the last WiFi setup step.
+
+The script uses `--config PATH` directly when you pass it. Otherwise it auto-loads configuration in this order:
+1. built-in defaults
+2. `scripts/flash-gw018-dm.conf`
+3. `scripts/flash-gw018-dm.local.conf`
+4. CLI flags
+
+If `scripts/flash-gw018-dm.conf` is missing and `scripts/flash-gw018-dm.conf.example` exists, the script copies the example to `scripts/flash-gw018-dm.conf`, tells you to adjust it, and stops. If the example is also missing, it tells you to create a config manually or use CLI flags.
+
+Use `scripts/flash-gw018-dm.conf.example` as the template. Put machine-specific values such as serial device paths, WiFi SSID, or passphrase into `scripts/flash-gw018-dm.conf` or `scripts/flash-gw018-dm.local.conf`. Both local config files are ignored by Git.
+
+Example runs:
+```
+bash scripts/flash-gw018-dm.sh all --run-id 22802077282
+bash scripts/flash-gw018-dm.sh flash --firmware-dir release_firmware --port /dev/ttyUSB0
+bash scripts/flash-gw018-dm.sh wifi --ssid "My WiFi" --passphrase "secret pass"
+```
+
+The helper stores session output under `.gw018-dm/sessions/<timestamp>/` and writes a ready-to-paste `zigbee2mqtt.yaml` file after it detects the gateway IP address.
+
 ## 1) Connect to the device via UART
 Open up the plastic case and remove the single screw. Solder pin headers to the PCB in P1 area. Connect them with jumper cables to a UART-TTL to USB adapter. Pin assignment is from left (outer edge) to right:
 
