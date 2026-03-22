@@ -16,6 +16,10 @@ FIRMWARE_STAGE_DIR=""
 UPLOAD_TOOL_PATH=""
 EXPLICIT_CONFIG=""
 COMMAND="all"
+SELECTED_FIRMWARE_SOURCE=""
+SELECTED_FIRMWARE_ROOT=""
+SELECTED_ARTIFACT_RUN_ID=""
+SELECTED_ARTIFACT_RUN_ID_AUTO="false"
 declare -a LOADED_CONFIG_FILES=()
 
 set_defaults() {
@@ -336,6 +340,10 @@ require_command() {
     command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
 }
 
+has_command() {
+    command -v "$1" >/dev/null 2>&1
+}
+
 ensure_directory() {
     mkdir -p "$1"
 }
@@ -361,18 +369,32 @@ prompt_continue() {
 
 preflight_checks() {
     require_command awk
+    require_command cat
+    require_command chmod
+    require_command cp
     require_command sed
     require_command grep
+    require_command mktemp
+    require_command readlink
+    require_command sleep
     require_command stty
-    require_command timeout
+    require_command tail
+    require_command tee
     require_command xxd
     require_command sha256sum
-    require_command unzip
     require_command find
     require_command date
-    if [[ -n "$RUN_ID" ]]; then
-        require_command gh
-    fi
+    require_command sort
+    case "$COMMAND" in
+        download|flash|all)
+            preflight_firmware_source_dependencies
+            ;;
+    esac
+    case "$COMMAND" in
+        flash|all)
+            preflight_upload_tool_dependencies
+            ;;
+    esac
 }
 
 prepare_session() {
@@ -399,6 +421,82 @@ find_unique_file() {
     printf '%s' "${matches[0]}"
 }
 
+describe_firmware_tree() {
+    local search_root="$1"
+    local image_name=""
+    local -a matches=()
+    [[ -d "$search_root" ]] || {
+        printf 'directory not found: %s' "$search_root"
+        return 1
+    }
+    for image_name in "${REQUIRED_IMAGE_NAMES[@]}"; do
+        mapfile -t matches < <(find "$search_root" -type f -name "$image_name" 2>/dev/null | sort)
+        if (( ${#matches[@]} == 0 )); then
+            printf 'missing %s under %s' "$image_name" "$search_root"
+            return 1
+        fi
+        if (( ${#matches[@]} > 1 )); then
+            printf 'found multiple copies of %s under %s' "$image_name" "$search_root"
+            return 1
+        fi
+    done
+    return 0
+}
+
+configured_firmware_dir_is_usable() {
+    local configured_firmware_root=""
+    [[ -n "$FIRMWARE_DIR" ]] || return 1
+    configured_firmware_root=$(resolve_root_path "$FIRMWARE_DIR")
+    describe_firmware_tree "$configured_firmware_root" >/dev/null 2>&1
+}
+
+preflight_firmware_source_dependencies() {
+    local configured_firmware_root=""
+    if has_command gh; then
+        return 0
+    fi
+    if configured_firmware_dir_is_usable; then
+        warn "gh is not installed. GitHub artifact firmware will be unavailable, but the configured local firmware directory is usable."
+        return 0
+    fi
+    configured_firmware_root=$(resolve_root_path "$FIRMWARE_DIR")
+    if [[ -n "$RUN_ID" ]]; then
+        die "gh is required to download firmware from run $RUN_ID"
+    fi
+    if [[ -n "$FIRMWARE_DIR" ]]; then
+        die "gh is required because the configured firmware directory is not usable: $configured_firmware_root"
+    fi
+    die "gh is required because no usable local firmware source is configured"
+}
+
+preflight_upload_tool_dependencies() {
+    local configured_upload_tool_path=""
+    local cache_upload_tool_path
+    local default_example_upload_tool_path
+    cache_upload_tool_path="$(resolve_root_path "$WORK_DIR")/tools/upload_image_tool_linux"
+    default_example_upload_tool_path=$(resolve_root_path ".gw018-dm/tools/upload_image_tool_linux")
+    if [[ -n "$UPLOAD_TOOL" ]]; then
+        configured_upload_tool_path=$(resolve_root_path "$UPLOAD_TOOL")
+        if [[ -f "$configured_upload_tool_path" ]]; then
+            return 0
+        fi
+        if [[ "$configured_upload_tool_path" == "$cache_upload_tool_path" || "$configured_upload_tool_path" == "$default_example_upload_tool_path" ]]; then
+            if has_command curl || has_command wget; then
+                return 0
+            fi
+            die "curl or wget is required to download the upload tool to $configured_upload_tool_path"
+        fi
+        die "Upload tool not found: $configured_upload_tool_path"
+    fi
+    if [[ -f "$cache_upload_tool_path" ]]; then
+        return 0
+    fi
+    if has_command curl || has_command wget; then
+        return 0
+    fi
+    die "curl or wget is required to download the upload tool to $cache_upload_tool_path"
+}
+
 stage_firmware_from_tree() {
     local search_root="$1"
     local destination_dir="$2"
@@ -410,24 +508,115 @@ stage_firmware_from_tree() {
     done
 }
 
-stage_firmware_from_repo_build() {
-    local destination_dir="$1"
-    local lp_image_dir="$ROOT_DIR/project/realtek_amebaD_va0_example/GCC-RELEASE/project_lp/asdk/image"
-    local hp_image_dir="$ROOT_DIR/project/realtek_amebaD_va0_example/GCC-RELEASE/project_hp/asdk/image"
-    [[ -f "$lp_image_dir/km0_boot_all.bin" ]] || die "Local build output missing: $lp_image_dir/km0_boot_all.bin"
-    [[ -f "$hp_image_dir/km4_boot_all.bin" ]] || die "Local build output missing: $hp_image_dir/km4_boot_all.bin"
-    [[ -f "$hp_image_dir/km0_km4_image2.bin" ]] || die "Local build output missing: $hp_image_dir/km0_km4_image2.bin"
-    cp "$lp_image_dir/km0_boot_all.bin" "$destination_dir/km0_boot_all.bin"
-    cp "$hp_image_dir/km4_boot_all.bin" "$destination_dir/km4_boot_all.bin"
-    cp "$hp_image_dir/km0_km4_image2.bin" "$destination_dir/km0_km4_image2.bin"
+artifact_run_has_named_artifact() {
+    local run_id="$1"
+    local artifact_name=""
+    while IFS= read -r artifact_name; do
+        if [[ "$artifact_name" == "$ARTIFACT_NAME" ]]; then
+            return 0
+        fi
+    done < <(gh api "repos/$REPO/actions/runs/$run_id/artifacts" --jq '.artifacts[]?.name' 2>/dev/null || true)
+    return 1
+}
+
+resolve_artifact_candidate_run_id() {
+    local requested_run_id="$1"
+    local run_id=""
+    if ! command -v gh >/dev/null 2>&1; then
+        printf '%s' "gh is not installed"
+        return 1
+    fi
+    if [[ -n "$requested_run_id" ]]; then
+        if artifact_run_has_named_artifact "$requested_run_id"; then
+            printf '%s' "$requested_run_id"
+            return 0
+        fi
+        printf '%s' "artifact $ARTIFACT_NAME was not found in run $requested_run_id from $REPO"
+        return 1
+    fi
+    while IFS= read -r run_id; do
+        [[ -n "$run_id" ]] || continue
+        if artifact_run_has_named_artifact "$run_id"; then
+            printf '%s' "$run_id"
+            return 0
+        fi
+    done < <(gh run list --repo "$REPO" --limit 50 --json databaseId,conclusion --jq '.[] | select(.conclusion == "success") | .databaseId' 2>/dev/null || true)
+    printf '%s' "could not find a successful run in $REPO with artifact $ARTIFACT_NAME"
+    return 1
+}
+
+select_firmware_source() {
+    local requested_run_id="$RUN_ID"
+    local configured_firmware_root=""
+    local local_source_issue=""
+    local artifact_source_issue=""
+    local artifact_candidate_run_id=""
+    local selection=""
+    SELECTED_FIRMWARE_SOURCE=""
+    SELECTED_FIRMWARE_ROOT=""
+    SELECTED_ARTIFACT_RUN_ID=""
+    SELECTED_ARTIFACT_RUN_ID_AUTO="false"
+
+    if [[ -n "$FIRMWARE_DIR" ]]; then
+        configured_firmware_root=$(resolve_root_path "$FIRMWARE_DIR")
+        if local_source_issue=$(describe_firmware_tree "$configured_firmware_root"); then
+            SELECTED_FIRMWARE_ROOT="$configured_firmware_root"
+            SELECTED_FIRMWARE_SOURCE="local"
+            return 0
+        else
+            warn "Ignoring configured firmware directory: $local_source_issue"
+        fi
+    fi
+
+    if artifact_source_issue=$(resolve_artifact_candidate_run_id "$requested_run_id"); then
+        artifact_candidate_run_id="$artifact_source_issue"
+        SELECTED_ARTIFACT_RUN_ID="$artifact_candidate_run_id"
+        if [[ -z "$requested_run_id" ]]; then
+            SELECTED_ARTIFACT_RUN_ID_AUTO="true"
+        fi
+    else
+        warn "GitHub artifact source unavailable: $artifact_source_issue"
+    fi
+
+    if [[ -n "$SELECTED_FIRMWARE_ROOT" && -n "$SELECTED_ARTIFACT_RUN_ID" ]]; then
+        if is_true "$ASSUME_YES"; then
+            SELECTED_FIRMWARE_SOURCE="local"
+            return 0
+        fi
+        [[ -t 0 ]] || die "Both local firmware and a GitHub artifact are available. Use --yes to prefer local firmware."
+        info "Choose the firmware source"
+        printf '  1. Local firmware: %s\n' "$SELECTED_FIRMWARE_ROOT"
+        printf '  2. GitHub artifact: %s run %s (%s)\n' "$REPO" "$SELECTED_ARTIFACT_RUN_ID" "$ARTIFACT_NAME"
+        printf 'Selection: '
+        read -r selection || die "Input aborted"
+        case "$selection" in
+            1) SELECTED_FIRMWARE_SOURCE="local" ;;
+            2) SELECTED_FIRMWARE_SOURCE="artifact" ;;
+            *) die "Invalid selection: $selection" ;;
+        esac
+        return 0
+    fi
+
+    if [[ -n "$SELECTED_FIRMWARE_ROOT" ]]; then
+        SELECTED_FIRMWARE_SOURCE="local"
+        return 0
+    fi
+
+    if [[ -n "$SELECTED_ARTIFACT_RUN_ID" ]]; then
+        SELECTED_FIRMWARE_SOURCE="artifact"
+        return 0
+    fi
+
+    die "No usable firmware source found. Set FIRMWARE_DIR to a directory with the required images, or make sure GitHub artifact access works for $REPO / $ARTIFACT_NAME."
 }
 
 download_artifact_files() {
     local destination_root="$1"
+    local artifact_run_id="$2"
     local artifact_dir="$destination_root/artifact"
     ensure_directory "$artifact_dir"
-    info "Downloading artifact $ARTIFACT_NAME from $REPO run $RUN_ID"
-    gh run download "$RUN_ID" --repo "$REPO" --name "$ARTIFACT_NAME" --dir "$artifact_dir" >/dev/null
+    info "Downloading artifact $ARTIFACT_NAME from $REPO run $artifact_run_id"
+    gh run download "$artifact_run_id" --repo "$REPO" --name "$ARTIFACT_NAME" --dir "$artifact_dir" >/dev/null
     stage_firmware_from_tree "$artifact_dir" "$destination_root"
 }
 
@@ -440,17 +629,16 @@ write_firmware_checksums() {
 
 stage_firmware() {
     FIRMWARE_STAGE_DIR="$(session_path firmware)"
-    if [[ -n "$FIRMWARE_DIR" ]]; then
-        local firmware_root
-        firmware_root=$(resolve_root_path "$FIRMWARE_DIR")
-        [[ -d "$firmware_root" ]] || die "Firmware directory not found: $firmware_root"
-        info "Using firmware from $firmware_root"
-        stage_firmware_from_tree "$firmware_root" "$FIRMWARE_STAGE_DIR"
-    elif [[ -n "$RUN_ID" ]]; then
-        download_artifact_files "$FIRMWARE_STAGE_DIR"
+    select_firmware_source
+    if [[ "$SELECTED_FIRMWARE_SOURCE" == "local" ]]; then
+        info "Using firmware from $SELECTED_FIRMWARE_ROOT"
+        stage_firmware_from_tree "$SELECTED_FIRMWARE_ROOT" "$FIRMWARE_STAGE_DIR"
     else
-        info "Using local repo build output"
-        stage_firmware_from_repo_build "$FIRMWARE_STAGE_DIR"
+        RUN_ID="$SELECTED_ARTIFACT_RUN_ID"
+        if is_true "$SELECTED_ARTIFACT_RUN_ID_AUTO"; then
+            info "Resolved latest successful artifact run: $RUN_ID"
+        fi
+        download_artifact_files "$FIRMWARE_STAGE_DIR" "$RUN_ID"
     fi
     write_firmware_checksums
 }
@@ -468,12 +656,26 @@ download_to_path() {
 }
 
 resolve_upload_tool_path() {
+    local configured_upload_tool_path=""
+    local cache_upload_tool_path="$WORK_DIR_ABS/tools/upload_image_tool_linux"
+    local default_example_upload_tool_path
+    default_example_upload_tool_path=$(resolve_root_path ".gw018-dm/tools/upload_image_tool_linux")
     if [[ -n "$UPLOAD_TOOL" ]]; then
-        UPLOAD_TOOL_PATH=$(resolve_root_path "$UPLOAD_TOOL")
-        [[ -f "$UPLOAD_TOOL_PATH" ]] || die "Upload tool not found: $UPLOAD_TOOL_PATH"
+        configured_upload_tool_path=$(resolve_root_path "$UPLOAD_TOOL")
+        UPLOAD_TOOL_PATH="$configured_upload_tool_path"
+        if [[ ! -f "$UPLOAD_TOOL_PATH" ]]; then
+            if [[ "$UPLOAD_TOOL_PATH" == "$cache_upload_tool_path" || "$UPLOAD_TOOL_PATH" == "$default_example_upload_tool_path" ]]; then
+                info "Downloading upload_image_tool_linux"
+                ensure_directory "$(dirname "$UPLOAD_TOOL_PATH")"
+                download_to_path "$DEFAULT_UPLOAD_TOOL_URL" "$UPLOAD_TOOL_PATH"
+            else
+                die "Upload tool not found: $UPLOAD_TOOL_PATH"
+            fi
+        fi
+        chmod +x "$UPLOAD_TOOL_PATH"
         return 0
     fi
-    UPLOAD_TOOL_PATH="$WORK_DIR_ABS/tools/upload_image_tool_linux"
+    UPLOAD_TOOL_PATH="$cache_upload_tool_path"
     if [[ ! -f "$UPLOAD_TOOL_PATH" ]]; then
         info "Downloading upload_image_tool_linux"
         download_to_path "$DEFAULT_UPLOAD_TOOL_URL" "$UPLOAD_TOOL_PATH"

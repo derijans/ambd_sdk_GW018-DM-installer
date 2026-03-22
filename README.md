@@ -6,13 +6,27 @@ The purpose of this is to cut the GW108-DM gateway from the cloud and use it as 
 ## Helper script
 This repo now includes a Linux helper script at `scripts/flash-gw018-dm.sh` that can stage firmware files, detect or select the USB-UART adapter, create a backup, flash the Realtek image, and guide the last WiFi setup step.
 
-The script uses `--config PATH` directly when you pass it. Otherwise it auto-loads configuration in this order:
+Pass `--config PATH` if you want to use one specific config file. Otherwise the script loads:
 1. built-in defaults
 2. `scripts/flash-gw018-dm.conf`
 3. `scripts/flash-gw018-dm.local.conf`
 4. CLI flags
 
 If `scripts/flash-gw018-dm.conf` is missing and `scripts/flash-gw018-dm.conf.example` exists, the script copies the example to `scripts/flash-gw018-dm.conf`, tells you to adjust it, and stops. If the example is also missing, it tells you to create a config manually or use CLI flags.
+
+The example config now uses these portable defaults:
+1. `FIRMWARE_DIR="project/realtek_amebaD_va0_example/GCC-RELEASE"`
+2. `UPLOAD_TOOL=".gw018-dm/tools/upload_image_tool_linux"`
+3. `PORT=""`
+4. `LOG_PORT=""`
+
+Blank `PORT` and `LOG_PORT` keep serial auto-detect enabled. If the script finds one adapter, it uses it directly. If it finds more than one, it asks you to choose. Blank `LOG_PORT` reuses the selected flash port.
+
+Blank `RUN_ID` now means "find the latest successful GitHub Actions run that contains `gw018-dm-custom-firmware`" only when no valid local firmware directory is configured. If `FIRMWARE_DIR` points to a valid image tree, the script uses it directly and does not require `gh`.
+
+The default upload tool path is treated like a cache location. If `.gw018-dm/tools/upload_image_tool_linux` is missing, the script downloads it there automatically.
+
+Before the selected command runs, the script checks the required host tools up front. That now includes `gh` when GitHub artifact access is needed, and `curl` or `wget` when the upload tool must be downloaded.
 
 Use `scripts/flash-gw018-dm.conf.example` as the template. Put machine-specific values such as serial device paths, WiFi SSID, or passphrase into `scripts/flash-gw018-dm.conf` or `scripts/flash-gw018-dm.local.conf`. Both local config files are ignored by Git.
 
