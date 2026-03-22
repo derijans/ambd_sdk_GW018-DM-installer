@@ -18,12 +18,17 @@ EXPLICIT_CONFIG=""
 COMMAND="all"
 SELECTED_FIRMWARE_SOURCE=""
 SELECTED_FIRMWARE_ROOT=""
+SELECTED_RELEASE_TAG=""
+SELECTED_RELEASE_ASSET_NAME=""
+SELECTED_RELEASE_AUTO="false"
 SELECTED_ARTIFACT_RUN_ID=""
 SELECTED_ARTIFACT_RUN_ID_AUTO="false"
 declare -a LOADED_CONFIG_FILES=()
 
 set_defaults() {
     REPO="derijans/ambd_sdk_GW018-DM"
+    RELEASE_TAG=""
+    RELEASE_ASSET_NAME=""
     RUN_ID=""
     ARTIFACT_NAME="gw018-dm-custom-firmware"
     FIRMWARE_DIR=""
@@ -70,8 +75,8 @@ Commands:
 Options:
   --config PATH
   --repo OWNER/REPO
-  --run-id ID
-  --artifact-name NAME
+  --release-tag TAG
+  --release-asset-name NAME
   --firmware-dir PATH
   --upload-tool PATH
   --port PATH
@@ -97,7 +102,7 @@ Config load order:
   5. CLI flags
 
 Examples:
-  $SCRIPT_NAME all --run-id 22802077282
+  $SCRIPT_NAME download --release-tag v1.0.0 --release-asset-name gw018-dm-custom-firmware-v1.0.0.zip
   $SCRIPT_NAME flash --firmware-dir release_firmware --port /dev/ttyUSB0
   $SCRIPT_NAME wifi --ssid "My WiFi" --passphrase "secret pass"
 EOF
@@ -244,6 +249,14 @@ parse_cli_args() {
                 REPO=$(require_option_value "$1" "${2-}")
                 shift 2
                 ;;
+            --release-tag)
+                RELEASE_TAG=$(require_option_value "$1" "${2-}")
+                shift 2
+                ;;
+            --release-asset-name)
+                RELEASE_ASSET_NAME=$(require_option_value "$1" "${2-}")
+                shift 2
+                ;;
             --run-id)
                 RUN_ID=$(require_option_value "$1" "${2-}")
                 shift 2
@@ -342,6 +355,14 @@ require_command() {
 
 has_command() {
     command -v "$1" >/dev/null 2>&1
+}
+
+has_http_download_support() {
+    has_command curl || has_command wget
+}
+
+has_release_archive_support() {
+    has_http_download_support && has_command unzip
 }
 
 ensure_directory() {
@@ -452,21 +473,24 @@ configured_firmware_dir_is_usable() {
 
 preflight_firmware_source_dependencies() {
     local configured_firmware_root=""
+    if [[ -n "$RELEASE_TAG" && -n "$RELEASE_ASSET_NAME" ]] && has_release_archive_support; then
+        return 0
+    fi
     if has_command gh; then
         return 0
     fi
     if configured_firmware_dir_is_usable; then
-        warn "gh is not installed. GitHub artifact firmware will be unavailable, but the configured local firmware directory is usable."
+        warn "gh is not installed. GitHub release discovery will be unavailable, but the configured local firmware directory is usable."
         return 0
     fi
     configured_firmware_root=$(resolve_root_path "$FIRMWARE_DIR")
-    if [[ -n "$RUN_ID" ]]; then
-        die "gh is required to download firmware from run $RUN_ID"
+    if [[ -n "$RELEASE_TAG" || -n "$RELEASE_ASSET_NAME" ]]; then
+        die "gh is required to resolve release downloads unless both RELEASE_TAG and RELEASE_ASSET_NAME are set and curl or wget plus unzip are installed"
     fi
     if [[ -n "$FIRMWARE_DIR" ]]; then
         die "gh is required because the configured firmware directory is not usable: $configured_firmware_root"
     fi
-    die "gh is required because no usable local firmware source is configured"
+    die "gh is required because no usable local firmware source is configured and no direct release download is configured"
 }
 
 preflight_upload_tool_dependencies() {
@@ -519,6 +543,52 @@ artifact_run_has_named_artifact() {
     return 1
 }
 
+release_asset_name_matches() {
+    local candidate_name="$1"
+    if [[ -n "$RELEASE_ASSET_NAME" ]]; then
+        [[ "$candidate_name" == "$RELEASE_ASSET_NAME" ]]
+        return
+    fi
+    [[ "$candidate_name" == "$ARTIFACT_NAME"-*.zip ]]
+}
+
+resolve_release_candidate() {
+    local release_tag="$RELEASE_TAG"
+    local resolved_tag=""
+    local release_endpoint=""
+    local asset_name=""
+    if has_command gh; then
+        if [[ -n "$release_tag" ]]; then
+            release_endpoint="repos/$REPO/releases/tags/$release_tag"
+        else
+            release_endpoint="repos/$REPO/releases/latest"
+        fi
+        resolved_tag=$(gh api "$release_endpoint" --jq '.tag_name' 2>/dev/null || true)
+        [[ -n "$resolved_tag" ]] || {
+            printf '%s' "could not find a GitHub release in $REPO"
+            return 1
+        }
+        while IFS= read -r asset_name; do
+            if release_asset_name_matches "$asset_name"; then
+                printf '%s|%s' "$resolved_tag" "$asset_name"
+                return 0
+            fi
+        done < <(gh api "$release_endpoint" --jq '.assets[]?.name' 2>/dev/null || true)
+        if [[ -n "$RELEASE_ASSET_NAME" ]]; then
+            printf '%s' "release $resolved_tag in $REPO does not contain asset $RELEASE_ASSET_NAME"
+            return 1
+        fi
+        printf '%s' "release $resolved_tag in $REPO does not contain a $ARTIFACT_NAME-*.zip asset"
+        return 1
+    fi
+    if [[ -n "$RELEASE_TAG" && -n "$RELEASE_ASSET_NAME" ]] && has_release_archive_support; then
+        printf '%s|%s' "$RELEASE_TAG" "$RELEASE_ASSET_NAME"
+        return 0
+    fi
+    printf '%s' "gh is not installed"
+    return 1
+}
+
 resolve_artifact_candidate_run_id() {
     local requested_run_id="$1"
     local run_id=""
@@ -546,52 +616,51 @@ resolve_artifact_candidate_run_id() {
 }
 
 select_firmware_source() {
-    local requested_run_id="$RUN_ID"
     local configured_firmware_root=""
     local local_source_issue=""
-    local artifact_source_issue=""
-    local artifact_candidate_run_id=""
+    local release_source_issue=""
+    local release_candidate=""
     local selection=""
     SELECTED_FIRMWARE_SOURCE=""
     SELECTED_FIRMWARE_ROOT=""
-    SELECTED_ARTIFACT_RUN_ID=""
-    SELECTED_ARTIFACT_RUN_ID_AUTO="false"
+    SELECTED_RELEASE_TAG=""
+    SELECTED_RELEASE_ASSET_NAME=""
+    SELECTED_RELEASE_AUTO="false"
 
     if [[ -n "$FIRMWARE_DIR" ]]; then
         configured_firmware_root=$(resolve_root_path "$FIRMWARE_DIR")
         if local_source_issue=$(describe_firmware_tree "$configured_firmware_root"); then
             SELECTED_FIRMWARE_ROOT="$configured_firmware_root"
-            SELECTED_FIRMWARE_SOURCE="local"
-            return 0
         else
             warn "Ignoring configured firmware directory: $local_source_issue"
         fi
     fi
 
-    if artifact_source_issue=$(resolve_artifact_candidate_run_id "$requested_run_id"); then
-        artifact_candidate_run_id="$artifact_source_issue"
-        SELECTED_ARTIFACT_RUN_ID="$artifact_candidate_run_id"
-        if [[ -z "$requested_run_id" ]]; then
-            SELECTED_ARTIFACT_RUN_ID_AUTO="true"
+    if release_source_issue=$(resolve_release_candidate); then
+        release_candidate="$release_source_issue"
+        SELECTED_RELEASE_TAG="${release_candidate%%|*}"
+        SELECTED_RELEASE_ASSET_NAME="${release_candidate#*|}"
+        if [[ -z "$RELEASE_TAG" || -z "$RELEASE_ASSET_NAME" ]]; then
+            SELECTED_RELEASE_AUTO="true"
         fi
     else
-        warn "GitHub artifact source unavailable: $artifact_source_issue"
+        warn "GitHub release source unavailable: $release_source_issue"
     fi
 
-    if [[ -n "$SELECTED_FIRMWARE_ROOT" && -n "$SELECTED_ARTIFACT_RUN_ID" ]]; then
+    if [[ -n "$SELECTED_FIRMWARE_ROOT" && -n "$SELECTED_RELEASE_TAG" ]]; then
         if is_true "$ASSUME_YES"; then
             SELECTED_FIRMWARE_SOURCE="local"
             return 0
         fi
-        [[ -t 0 ]] || die "Both local firmware and a GitHub artifact are available. Use --yes to prefer local firmware."
+        [[ -t 0 ]] || die "Both local firmware and a GitHub release are available. Use --yes to prefer local firmware."
         info "Choose the firmware source"
         printf '  1. Local firmware: %s\n' "$SELECTED_FIRMWARE_ROOT"
-        printf '  2. GitHub artifact: %s run %s (%s)\n' "$REPO" "$SELECTED_ARTIFACT_RUN_ID" "$ARTIFACT_NAME"
+        printf '  2. GitHub release: %s tag %s (%s)\n' "$REPO" "$SELECTED_RELEASE_TAG" "$SELECTED_RELEASE_ASSET_NAME"
         printf 'Selection: '
         read -r selection || die "Input aborted"
         case "$selection" in
             1) SELECTED_FIRMWARE_SOURCE="local" ;;
-            2) SELECTED_FIRMWARE_SOURCE="artifact" ;;
+            2) SELECTED_FIRMWARE_SOURCE="release" ;;
             *) die "Invalid selection: $selection" ;;
         esac
         return 0
@@ -602,12 +671,26 @@ select_firmware_source() {
         return 0
     fi
 
-    if [[ -n "$SELECTED_ARTIFACT_RUN_ID" ]]; then
-        SELECTED_FIRMWARE_SOURCE="artifact"
+    if [[ -n "$SELECTED_RELEASE_TAG" ]]; then
+        SELECTED_FIRMWARE_SOURCE="release"
         return 0
     fi
 
-    die "No usable firmware source found. Set FIRMWARE_DIR to a directory with the required images, or make sure GitHub artifact access works for $REPO / $ARTIFACT_NAME."
+    die "No usable firmware source found. Set FIRMWARE_DIR to a directory with the required images or configure a GitHub release asset."
+}
+
+download_release_files() {
+    local destination_root="$1"
+    local release_tag="$2"
+    local release_asset_name="$3"
+    local release_dir="$destination_root/release"
+    local archive_path="$release_dir/$release_asset_name"
+    local download_url="https://github.com/$REPO/releases/download/$release_tag/$release_asset_name"
+    ensure_directory "$release_dir"
+    info "Downloading release asset $release_asset_name from $REPO tag $release_tag"
+    download_to_path "$download_url" "$archive_path"
+    unzip -oq "$archive_path" -d "$release_dir"
+    stage_firmware_from_tree "$release_dir" "$destination_root"
 }
 
 download_artifact_files() {
@@ -634,11 +717,10 @@ stage_firmware() {
         info "Using firmware from $SELECTED_FIRMWARE_ROOT"
         stage_firmware_from_tree "$SELECTED_FIRMWARE_ROOT" "$FIRMWARE_STAGE_DIR"
     else
-        RUN_ID="$SELECTED_ARTIFACT_RUN_ID"
-        if is_true "$SELECTED_ARTIFACT_RUN_ID_AUTO"; then
-            info "Resolved latest successful artifact run: $RUN_ID"
+        if is_true "$SELECTED_RELEASE_AUTO"; then
+            info "Resolved GitHub release: $SELECTED_RELEASE_TAG ($SELECTED_RELEASE_ASSET_NAME)"
         fi
-        download_artifact_files "$FIRMWARE_STAGE_DIR" "$RUN_ID"
+        download_release_files "$FIRMWARE_STAGE_DIR" "$SELECTED_RELEASE_TAG" "$SELECTED_RELEASE_ASSET_NAME"
     fi
     write_firmware_checksums
 }
