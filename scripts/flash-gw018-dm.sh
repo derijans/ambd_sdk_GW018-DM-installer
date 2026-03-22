@@ -21,16 +21,13 @@ SELECTED_FIRMWARE_ROOT=""
 SELECTED_RELEASE_TAG=""
 SELECTED_RELEASE_ASSET_NAME=""
 SELECTED_RELEASE_AUTO="false"
-SELECTED_ARTIFACT_RUN_ID=""
-SELECTED_ARTIFACT_RUN_ID_AUTO="false"
 declare -a LOADED_CONFIG_FILES=()
 
 set_defaults() {
     REPO="derijans/ambd_sdk_GW018-DM"
     RELEASE_TAG=""
     RELEASE_ASSET_NAME=""
-    RUN_ID=""
-    ARTIFACT_NAME="gw018-dm-custom-firmware"
+    RELEASE_BUNDLE_NAME="gw018-dm-custom-firmware"
     FIRMWARE_DIR=""
     UPLOAD_TOOL=""
     PORT=""
@@ -257,14 +254,6 @@ parse_cli_args() {
                 RELEASE_ASSET_NAME=$(require_option_value "$1" "${2-}")
                 shift 2
                 ;;
-            --run-id)
-                RUN_ID=$(require_option_value "$1" "${2-}")
-                shift 2
-                ;;
-            --artifact-name)
-                ARTIFACT_NAME=$(require_option_value "$1" "${2-}")
-                shift 2
-                ;;
             --firmware-dir)
                 FIRMWARE_DIR=$(require_option_value "$1" "${2-}")
                 shift 2
@@ -363,6 +352,15 @@ has_http_download_support() {
 
 has_release_archive_support() {
     has_http_download_support && has_command unzip
+}
+
+release_asset_name_for_tag() {
+    local release_tag="$1"
+    if [[ -n "$RELEASE_ASSET_NAME" ]]; then
+        printf '%s' "$RELEASE_ASSET_NAME"
+        return 0
+    fi
+    printf '%s-%s.zip' "$RELEASE_BUNDLE_NAME" "$release_tag"
 }
 
 ensure_directory() {
@@ -473,24 +471,21 @@ configured_firmware_dir_is_usable() {
 
 preflight_firmware_source_dependencies() {
     local configured_firmware_root=""
-    if [[ -n "$RELEASE_TAG" && -n "$RELEASE_ASSET_NAME" ]] && has_release_archive_support; then
-        return 0
-    fi
-    if has_command gh; then
+    if has_release_archive_support; then
         return 0
     fi
     if configured_firmware_dir_is_usable; then
-        warn "gh is not installed. GitHub release discovery will be unavailable, but the configured local firmware directory is usable."
+        warn "Release downloads are unavailable, but the configured local firmware directory is usable."
         return 0
     fi
     configured_firmware_root=$(resolve_root_path "$FIRMWARE_DIR")
     if [[ -n "$RELEASE_TAG" || -n "$RELEASE_ASSET_NAME" ]]; then
-        die "gh is required to resolve release downloads unless both RELEASE_TAG and RELEASE_ASSET_NAME are set and curl or wget plus unzip are installed"
+        die "curl or wget plus unzip is required to download release assets"
     fi
     if [[ -n "$FIRMWARE_DIR" ]]; then
-        die "gh is required because the configured firmware directory is not usable: $configured_firmware_root"
+        die "configured firmware directory is not usable: $configured_firmware_root"
     fi
-    die "gh is required because no usable local firmware source is configured and no direct release download is configured"
+    die "No usable local firmware source is configured and release downloads require curl or wget plus unzip"
 }
 
 preflight_upload_tool_dependencies() {
@@ -532,86 +527,36 @@ stage_firmware_from_tree() {
     done
 }
 
-artifact_run_has_named_artifact() {
-    local run_id="$1"
-    local artifact_name=""
-    while IFS= read -r artifact_name; do
-        if [[ "$artifact_name" == "$ARTIFACT_NAME" ]]; then
-            return 0
-        fi
-    done < <(gh api "repos/$REPO/actions/runs/$run_id/artifacts" --jq '.artifacts[]?.name' 2>/dev/null || true)
-    return 1
-}
-
-release_asset_name_matches() {
-    local candidate_name="$1"
-    if [[ -n "$RELEASE_ASSET_NAME" ]]; then
-        [[ "$candidate_name" == "$RELEASE_ASSET_NAME" ]]
-        return
+resolve_latest_release_tag_from_redirect() {
+    local latest_release_url="https://github.com/$REPO/releases/latest"
+    local resolved_url=""
+    if has_command curl; then
+        resolved_url=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$latest_release_url" 2>/dev/null || true)
+    elif has_command wget; then
+        resolved_url=$(wget -q --max-redirect=20 --server-response --spider "$latest_release_url" 2>&1 | awk '/^  Location: / {print $2}' | tr -d '\r' | tail -n 1)
     fi
-    [[ "$candidate_name" == "$ARTIFACT_NAME"-*.zip ]]
+    [[ -n "$resolved_url" ]] || return 1
+    printf '%s' "${resolved_url##*/}"
 }
 
 resolve_release_candidate() {
     local release_tag="$RELEASE_TAG"
     local resolved_tag=""
-    local release_endpoint=""
     local asset_name=""
-    if has_command gh; then
+    if has_release_archive_support; then
         if [[ -n "$release_tag" ]]; then
-            release_endpoint="repos/$REPO/releases/tags/$release_tag"
+            resolved_tag="$release_tag"
         else
-            release_endpoint="repos/$REPO/releases/latest"
+            resolved_tag=$(resolve_latest_release_tag_from_redirect) || {
+                printf '%s' "could not resolve the latest GitHub release in $REPO"
+                return 1
+            }
         fi
-        resolved_tag=$(gh api "$release_endpoint" --jq '.tag_name' 2>/dev/null || true)
-        [[ -n "$resolved_tag" ]] || {
-            printf '%s' "could not find a GitHub release in $REPO"
-            return 1
-        }
-        while IFS= read -r asset_name; do
-            if release_asset_name_matches "$asset_name"; then
-                printf '%s|%s' "$resolved_tag" "$asset_name"
-                return 0
-            fi
-        done < <(gh api "$release_endpoint" --jq '.assets[]?.name' 2>/dev/null || true)
-        if [[ -n "$RELEASE_ASSET_NAME" ]]; then
-            printf '%s' "release $resolved_tag in $REPO does not contain asset $RELEASE_ASSET_NAME"
-            return 1
-        fi
-        printf '%s' "release $resolved_tag in $REPO does not contain a $ARTIFACT_NAME-*.zip asset"
-        return 1
-    fi
-    if [[ -n "$RELEASE_TAG" && -n "$RELEASE_ASSET_NAME" ]] && has_release_archive_support; then
-        printf '%s|%s' "$RELEASE_TAG" "$RELEASE_ASSET_NAME"
+        asset_name=$(release_asset_name_for_tag "$resolved_tag")
+        printf '%s|%s' "$resolved_tag" "$asset_name"
         return 0
     fi
-    printf '%s' "gh is not installed"
-    return 1
-}
-
-resolve_artifact_candidate_run_id() {
-    local requested_run_id="$1"
-    local run_id=""
-    if ! command -v gh >/dev/null 2>&1; then
-        printf '%s' "gh is not installed"
-        return 1
-    fi
-    if [[ -n "$requested_run_id" ]]; then
-        if artifact_run_has_named_artifact "$requested_run_id"; then
-            printf '%s' "$requested_run_id"
-            return 0
-        fi
-        printf '%s' "artifact $ARTIFACT_NAME was not found in run $requested_run_id from $REPO"
-        return 1
-    fi
-    while IFS= read -r run_id; do
-        [[ -n "$run_id" ]] || continue
-        if artifact_run_has_named_artifact "$run_id"; then
-            printf '%s' "$run_id"
-            return 0
-        fi
-    done < <(gh run list --repo "$REPO" --limit 50 --json databaseId,conclusion --jq '.[] | select(.conclusion == "success") | .databaseId' 2>/dev/null || true)
-    printf '%s' "could not find a successful run in $REPO with artifact $ARTIFACT_NAME"
+    printf '%s' "curl or wget plus unzip are unavailable"
     return 1
 }
 
@@ -691,16 +636,6 @@ download_release_files() {
     download_to_path "$download_url" "$archive_path"
     unzip -oq "$archive_path" -d "$release_dir"
     stage_firmware_from_tree "$release_dir" "$destination_root"
-}
-
-download_artifact_files() {
-    local destination_root="$1"
-    local artifact_run_id="$2"
-    local artifact_dir="$destination_root/artifact"
-    ensure_directory "$artifact_dir"
-    info "Downloading artifact $ARTIFACT_NAME from $REPO run $artifact_run_id"
-    gh run download "$artifact_run_id" --repo "$REPO" --name "$ARTIFACT_NAME" --dir "$artifact_dir" >/dev/null
-    stage_firmware_from_tree "$artifact_dir" "$destination_root"
 }
 
 write_firmware_checksums() {
